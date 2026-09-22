@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	regexp "github.com/wasilibs/go-re2"
 	"os"
 	"strings"
 
@@ -17,6 +16,7 @@ import (
 	"github.com/trufflesecurity/trufflehog/v3/pkg/analyzer/analyzers"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/analyzer/config"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/context"
+	"github.com/trufflesecurity/trufflehog/v3/pkg/postgresurl"
 )
 
 var _ analyzers.Analyzer = (*Analyzer)(nil)
@@ -222,8 +222,6 @@ const (
 	pg_user            = "user"
 )
 
-var connStrPartPattern = regexp.MustCompile(`([[:alpha:]]+)='(.+?)' ?`)
-
 type SecretInfo struct {
 	Host       string
 	User       string
@@ -266,18 +264,13 @@ func AnalyzeAndPrintPermissions(cfg *config.Config, connectionStr string) {
 }
 
 func AnalyzePermissions(ctx context.Context, cfg *config.Config, connectionStr string) (*SecretInfo, error) {
-
-	connStr, err := pq.ParseURL(string(connectionStr))
+	params, err := postgresurl.Parse(string(connectionStr))
 	if err != nil {
 		err = fmt.Errorf("failed to parse Postgres connection string: %w", err)
 		ctx.Logger().Error(err, "invalid postgres connection string")
 		return nil, err
 	}
-	parts := connStrPartPattern.FindAllStringSubmatch(connStr, -1)
-	params := make(map[string]string, len(parts))
-	for _, part := range parts {
-		params[part[1]] = part[2]
-	}
+
 	db, err := createConnection(ctx, params, "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Postgres database: %w", err)

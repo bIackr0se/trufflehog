@@ -17,6 +17,7 @@ import (
 	"github.com/trufflesecurity/trufflehog/v3/pkg/common"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/detectors"
 	"github.com/trufflesecurity/trufflehog/v3/pkg/pb/detector_typepb"
+	"github.com/trufflesecurity/trufflehog/v3/pkg/postgresurl"
 )
 
 const (
@@ -249,15 +250,9 @@ func findUriMatches(data []byte, ignorePatterns []*regexp.Regexp) []uriMatch {
 		}
 		dbType := string(dbTypeMatch[1])
 
-		connStr, err := pq.ParseURL(string(uri))
+		params, err := postgresurl.Parse(string(uri))
 		if err != nil {
 			continue
-		}
-
-		parts := connStrPartPattern.FindAllStringSubmatch(connStr, -1)
-		params := make(map[string]string, len(parts))
-		for _, part := range parts {
-			params[part[1]] = part[2]
 		}
 
 		params[pgDbType] = dbType
