@@ -645,14 +645,14 @@ func executeClone(ctx context.Context, params cloneParams) (*git.Repository, err
 	}
 
 	gitArgs = append(gitArgs, "clone")
+	// Mirror clones already carry every ref. Other clones have to ask for the
+	// refs outside refs/heads separately, after the clone; see
+	// fetchAdditionalRefs.
+	wantAdditionalRefs := false
 	if feature.UseGitMirror.Load() && cloneURL.Scheme != "file" {
 		gitArgs = append(gitArgs, "--mirror")
 	} else {
-		if !feature.SkipAdditionalRefs.Load() {
-			gitArgs = append(gitArgs,
-				"-c",
-				"remote.origin.fetch=+refs/*:refs/remotes/origin/*")
-		}
+		wantAdditionalRefs = !feature.SkipAdditionalRefs.Load()
 	}
 
 	var cancel context.CancelFunc
@@ -703,6 +703,12 @@ func executeClone(ctx context.Context, params cloneParams) (*git.Repository, err
 		return nil, fmt.Errorf("could not clone repo: %s, %w", safeURL, err)
 	}
 
+	if wantAdditionalRefs {
+		if err := fetchAdditionalRefs(ctx, params.clonePath); err != nil {
+			return nil, fmt.Errorf("could not clone repo: %s, %w", safeURL, err)
+		}
+	}
+
 	repo, err := RepoFromPath(params.clonePath)
 	if err != nil {
 		return nil, fmt.Errorf("could not open cloned repo: %w", err)
@@ -712,6 +718,40 @@ func executeClone(ctx context.Context, params cloneParams) (*git.Repository, err
 	metricsInstance.RecordCloneOperation(statusSuccess, cloneSuccess, 0)
 
 	return repo, nil
+}
+
+// additionalRefsSpec fetches the refs a plain clone leaves behind: tags, notes
+// and the pull or merge request refs that hold code never merged to a branch.
+const additionalRefsSpec = "+refs/*:refs/remotes/origin/*"
+
+// fetchAdditionalRefs brings additionalRefsSpec into an existing clone.
+//
+// This cannot be folded into the clone as
+// `-c remote.origin.fetch=+refs/*:refs/remotes/origin/*`, because git clone
+// adds its own +refs/heads/*:refs/remotes/origin/* on top of that value. A
+// repository that holds both refs/heads/<name> and refs/<name> then drives two
+// source refs onto refs/remotes/origin/<name> and git refuses the whole clone
+// with "multiple updates for ref". Passing the refspec to git fetch keeps it
+// the only refspec for that fetch, where each source ref keeps its own
+// destination under refs/remotes/origin/, so no pair of refs can collide.
+func fetchAdditionalRefs(ctx context.Context, repoPath string) error {
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "fetch", "--quiet", "origin", additionalRefsSpec)
+	output, err := cmd.CombinedOutput()
+	ctx.Logger().V(3).Info("git fetch of additional refs finished", "path", repoPath, "output", string(output))
+
+	if common.IsDone(ctx) {
+		return fmt.Errorf("git fetch of additional refs timed out")
+	}
+	if err != nil || cmd.ProcessState == nil || cmd.ProcessState.ExitCode() != 0 {
+		exitCode := 0
+		if cmd.ProcessState != nil {
+			exitCode = cmd.ProcessState.ExitCode()
+		}
+		metricsInstance.RecordCloneOperation(statusFailure, ClassifyCloneError(string(output)), exitCode)
+		return fmt.Errorf("error fetching additional refs: %w, %s", err, output)
+	}
+
+	return nil
 }
 
 // PingRepoUsingToken executes git ls-remote on a repo and returns any error that occurs. It can be used to validate
@@ -1471,6 +1511,13 @@ func TryAdditionalBaseRefs(repo *git.Repository, base string) (*plumbing.Hash, e
 	revisionPrefixes := []string{
 		"",
 		"refs/heads/",
+		// A branch whose name starts with another ref namespace, say
+		// tags/v1, shares refs/remotes/origin/tags/v1 with the tag v1. The
+		// additional refs fetch keeps the branch under its full source path,
+		// so look there before the shared name to resolve a branch to the
+		// branch. Ordinary branches sit at both and resolve the same either
+		// way.
+		"refs/remotes/origin/heads/",
 		"refs/remotes/origin/",
 	}
 	for _, prefix := range revisionPrefixes {

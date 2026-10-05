@@ -2324,3 +2324,154 @@ func gitHasObject(t *testing.T, repoPath, rev string) bool {
 	t.Helper()
 	return exec.Command("git", "-C", repoPath, "cat-file", "-e", rev+"^{commit}").Run() == nil
 }
+
+// gitForEachRef lists every ref in a repository as "refname sha" lines.
+func gitForEachRef(t *testing.T, repoPath string) map[string]string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", repoPath, "for-each-ref", "--format=%(refname) %(objectname)").Output()
+	assert.NoError(t, err)
+	refs := make(map[string]string)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		name, sha, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		refs[name] = sha
+	}
+	return refs
+}
+
+// newRefCollisionRepo builds a repository whose refs collide under the
+// additional-refs fetch: extraRef and refs/heads/<name> both map onto
+// refs/remotes/origin/<name>. It returns the repo path and the two commits.
+func newRefCollisionRepo(t *testing.T, name, extraRef string) (repoPath, branchCommit, extraCommit string) {
+	t.Helper()
+	repoPath = filepath.Join(t.TempDir(), "ref-collision")
+	runGit(t, "", "init", "--quiet", "--initial-branch=main", repoPath)
+	runGit(t, repoPath, "config", "user.name", "Test User")
+	runGit(t, repoPath, "config", "user.email", "test@example.com")
+	runGit(t, repoPath, "config", "commit.gpgsign", "false")
+	addTestFileAndCommit(t, repoPath, "first.txt", "AKIAIOSFODNN7EXAMPLE first")
+	extraCommit = gitRevParse(t, repoPath, "HEAD")
+	addTestFileAndCommit(t, repoPath, "second.txt", "AKIAIOSFODNN7EXAMPLE second")
+	branchCommit = gitRevParse(t, repoPath, "HEAD")
+
+	runGit(t, repoPath, "update-ref", "refs/heads/"+name, branchCommit)
+	runGit(t, repoPath, "update-ref", extraRef, extraCommit)
+	return repoPath, branchCommit, extraCommit
+}
+
+// TestCloneRepo_LocalRefNamespaceCollision covers trufflesecurity/trufflehog#5390.
+// Local file:// URLs are cloned without --mirror so staged changes stay
+// scannable, and the clone asks for the additional refs with
+// remote.origin.fetch=+refs/*:refs/remotes/origin/*. git clone keeps its own
+// +refs/heads/*:refs/remotes/origin/* refspec as well, so a repository holding
+// both refs/heads/<name> and refs/<name> drives two source refs onto one
+// destination and git aborts the clone with "multiple updates for ref".
+func TestCloneRepo_LocalRefNamespaceCollision(t *testing.T) {
+	// The OSS binary turns the mirror feature on; file:// URLs still take the
+	// additional-refs path, so the flag state must not hide the defect.
+	defer func(prev bool) { feature.UseGitMirror.Store(prev) }(feature.UseGitMirror.Load())
+	feature.UseGitMirror.Store(true)
+
+	cases := []struct {
+		name     string
+		branch   string
+		extraRef string
+		// Which tip --branch <branch> has to select. git's own rules decide
+		// this, and --skip-additional-refs already resolves these names the
+		// same way, so the fetch of additional refs must not move them.
+		wantBranchTip bool
+	}{
+		// The reporter's shape: a branch under refs/heads/remotes/ beside a
+		// remote-tracking ref of the same tail. Nothing else claims the name,
+		// so it has to reach the branch.
+		{name: "branch beside remote-tracking ref", branch: "remotes/archive/stable", extraRef: "refs/remotes/archive/stable", wantBranchTip: true},
+		// The same collision from an ordinary release convention: a branch
+		// named tags/v1 beside the tag v1. `git rev-parse tags/v1` names the
+		// tag, so the tag stays the answer here.
+		{name: "branch beside tag", branch: "tags/v1", extraRef: "refs/tags/v1", wantBranchTip: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			repoPath, branchCommit, extraCommit := newRefCollisionRepo(t, tc.branch, tc.extraRef)
+
+			clonePath, repo, err := CloneRepoUsingUnauthenticated(ctx, "file://"+repoPath, "")
+			if clonePath != "" {
+				defer func() { _ = os.RemoveAll(clonePath) }()
+			}
+			assert.NoError(t, err, "clone of a repo with colliding ref names must succeed")
+			if err != nil {
+				return
+			}
+
+			// The name a scan is pointed at must still select the same tip,
+			// or the scan silently covers the wrong commits.
+			want := extraCommit
+			if tc.wantBranchTip {
+				want = branchCommit
+			}
+			resolved, err := TryAdditionalBaseRefs(repo, tc.branch)
+			assert.NoError(t, err)
+			if err == nil {
+				assert.Equal(t, want, resolved.String(), "%q resolved to the wrong tip", tc.branch)
+			}
+
+			// Both tips have to stay reachable from a ref, or the scan skips
+			// whichever ref lost the collision.
+			assert.True(t, gitHasObject(t, clonePath, branchCommit), "branch tip %s missing from clone", branchCommit)
+			assert.True(t, gitHasObject(t, clonePath, extraCommit), "extra ref tip %s missing from clone", extraCommit)
+
+			refs := gitForEachRef(t, clonePath)
+			var holdsBranch, holdsExtra bool
+			for _, sha := range refs {
+				holdsBranch = holdsBranch || sha == branchCommit
+				holdsExtra = holdsExtra || sha == extraCommit
+			}
+			assert.True(t, holdsBranch, "no ref points at the branch tip; refs=%v", refs)
+			assert.True(t, holdsExtra, "no ref points at the colliding ref tip; refs=%v", refs)
+		})
+	}
+}
+
+// TestCloneRepo_LocalClonesKeepAdditionalRefs is the negative control for
+// trufflesecurity/trufflehog#5390: dropping the additional-refs fetch would
+// also stop the collision, and would silently stop scanning every ref outside
+// refs/heads, which is what that fetch exists for.
+func TestCloneRepo_LocalClonesKeepAdditionalRefs(t *testing.T) {
+	defer func(prev bool) { feature.UseGitMirror.Store(prev) }(feature.UseGitMirror.Load())
+	feature.UseGitMirror.Store(true)
+
+	ctx := context.Background()
+	repoPath := filepath.Join(t.TempDir(), "extra-refs")
+	runGit(t, "", "init", "--quiet", "--initial-branch=main", repoPath)
+	runGit(t, repoPath, "config", "user.name", "Test User")
+	runGit(t, repoPath, "config", "user.email", "test@example.com")
+	runGit(t, repoPath, "config", "commit.gpgsign", "false")
+	addTestFileAndCommit(t, repoPath, "first.txt", "AKIAIOSFODNN7EXAMPLE first")
+	hidden := gitRevParse(t, repoPath, "HEAD")
+	addTestFileAndCommit(t, repoPath, "second.txt", "AKIAIOSFODNN7EXAMPLE second")
+
+	// A merge-request style ref that no branch points at. Only the additional
+	// refs fetch brings it into the clone.
+	runGit(t, repoPath, "update-ref", "refs/merge-requests/7/head", hidden)
+
+	clonePath, _, err := CloneRepoUsingUnauthenticated(ctx, "file://"+repoPath, "")
+	if clonePath != "" {
+		defer func() { _ = os.RemoveAll(clonePath) }()
+	}
+	assert.NoError(t, err)
+	if err != nil {
+		return
+	}
+
+	refs := gitForEachRef(t, clonePath)
+	_, ok := refs["refs/remotes/origin/merge-requests/7/head"]
+	assert.True(t, ok, "additional ref refs/merge-requests/7/head was not fetched; refs=%v", refs)
+	assert.Equal(t, hidden, refs["refs/remotes/origin/merge-requests/7/head"])
+}
